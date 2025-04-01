@@ -26,14 +26,16 @@ import dateutil.parser as parser
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from httplib2 import Http
-from oauth2client import client, file, tools
-from oauth2client.clientsecrets import InvalidClientSecretsError
+# from oauth2client import client, file, tools
+# from oauth2client.clientsecrets import InvalidClientSecretsError
 
 from simplegmail import label
 from simplegmail.attachment import Attachment
 from simplegmail.label import Label
 from simplegmail.message import Message
-
+import pickle
+from google.oauth2 import service_account
+from google.auth.transport.requests import Request
 
 class Gmail(object):
     """
@@ -55,55 +57,54 @@ class Gmail(object):
     # Allow Gmail to read and write emails, and access settings like aliases.
     _SCOPES = [
         'https://www.googleapis.com/auth/gmail.modify',
-        'https://www.googleapis.com/auth/gmail.settings.basic'
+        # 'https://www.googleapis.com/auth/gmail.settings.basic',
+        'https://www.googleapis.com/auth/gmail.readonly'
     ]
 
-    # If you don't have a client secret file, follow the instructions at:
-    # https://developers.google.com/gmail/api/quickstart/python
-    # Make sure the client secret file is in the root directory of your app.
 
     def __init__(
         self,
-        client_secret_file: str = 'client_secret.json',
-        creds_file: str = 'gmail_token.json',
-        access_type: str = 'offline',
-        noauth_local_webserver: bool = False,
-        _creds: Optional[client.OAuth2Credentials] = None,
+        creds_file: str = 'credentials.json',
+        token_path: str = 'token.pickle',
+        delegated_email: str = None,
+        _creds=None
     ) -> None:
-        self.client_secret_file = client_secret_file
+
         self.creds_file = creds_file
-
+        self.email=delegated_email
         try:
-            # The file gmail_token.json stores the user's access and refresh
-            # tokens, and is created automatically when the authorization flow
-            # completes for the first time.
             if _creds:
-                self.creds = _creds
+                self.creds = _creds  
             else:
-                store = file.Storage(self.creds_file)
-                self.creds = store.get()
 
-            if not self.creds or self.creds.invalid:
-                flow = client.flow_from_clientsecrets(
-                    self.client_secret_file, self._SCOPES
-                )
+                self.creds = None
 
-                flow.params['access_type'] = access_type
-                flow.params['prompt'] = 'consent'
+                # Load credentials from file if they exist
+                if os.path.exists(token_path):
+                    with open(token_path, 'rb') as token:
+                        self.creds = pickle.load(token)
+                
+                # If no valid credentials, let user log in
+                if not self.creds or not self.creds.valid:
 
-                args = []
-                if noauth_local_webserver:
-                    args.append('--noauth_local_webserver')
 
-                flags = tools.argparser.parse_args(args)
-                self.creds = tools.run_flow(flow, store, flags)
+                    service_account_file = self.creds_file
 
-            self._service = build(
-                'gmail', 'v1', http=self.creds.authorize(Http()),
-                cache_discovery=False
-            )
+                    self.creds = service_account.Credentials.from_service_account_file(
+                                service_account_file, 
+                                scopes=self._SCOPES,
+                                subject=delegated_email  # The email of the user to impersonate
+                            )
 
-        except InvalidClientSecretsError:
+                    #print(self.creds)
+                    # Save the credentials for the next run
+                    with open(token_path, 'wb') as token:
+                        pickle.dump(self.creds, token)
+                
+            self._service=build('gmail', 'v1', credentials=self.creds)
+            
+
+        except Exception as e:
             raise FileNotFoundError(
                 "Your 'client_secret.json' file is nonexistent. Make sure "
                 "the file is in the root directory of your application. If "
@@ -114,12 +115,14 @@ class Gmail(object):
 
     @property
     def service(self) -> 'googleapiclient.discovery.Resource':
-        # Since the token is only used through calls to the service object,
         # this ensure that the token is always refreshed before use.
-        if self.creds.access_token_expired:
-            self.creds.refresh(Http())
 
+        if self.creds and self.creds.expired and self.creds.refresh_token:
+                self.creds.refresh(Request())
+        
         return self._service
+
+        
 
     def send_message(
         self,
@@ -528,6 +531,7 @@ class Gmail(object):
                 includeSpamTrash=include_spam_trash
             ).execute()
 
+            print(response)
             message_refs = []
             if 'messages' in response:  # ensure request was successful
                 message_refs.extend(response['messages'])
@@ -548,8 +552,10 @@ class Gmail(object):
                                                 attachments)
 
         except HttpError as error:
+            import traceback
+            traceback.print_exc()
             # Pass along the error
-            raise error
+            #raise error
 
     def list_labels(self, user_id: str = 'me') -> List[Label]:
         """
